@@ -1,5 +1,8 @@
 ## Automate the creation of AWS support cases using Amazon CloudWatch Alarms
 
+[![License](https://img.shields.io/badge/license-MIT--0-green)](LICENSE)
+[![AWS Provider](https://img.shields.io/badge/provider-AWS-orange?logo=amazon-aws&color=ff9900)](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/WhatIsCloudWatch.html)
+
 TODO: Fill this README out!
 
 Be sure to:
