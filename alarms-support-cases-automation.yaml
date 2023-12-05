@@ -1,0 +1,691 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation Stack for Automating Creating Support Cases using CloudWatch Alarms
+
+# IMPORTANT: AWS CloudFormation templates provided as examples are for informational and educational purposes only.
+# They are provided on an 'as-is' basis and AWS does not provide warranties, guarantees, or support for these templates.
+# Use these templates at your own risk. Before using any template, make sure to review and adapt it to meet your
+# specific needs, security requirements, and compliance standards. Always test thoroughly in a non-production environment
+# before deploying it to production. AWS does not assume liability for any issues, damages, or consequences that may arise
+# from using or misusing these templates. By using these templates, you acknowledge and accept these terms and limitations.
+# For official AWS documentation, best practices, and support, refer to the AWS official website and resources.
+# It is recommended to consult with your legal and technical teams before deploying any template in a production environment.
+# Remember that AWS CloudFormation is a powerful tool that can modify and provision AWS resources, so use it responsibly.
+# For any questions, concerns, or assistance, please consult with AWS support or other relevant professionals.
+
+Parameters:
+
+  BedrockRegionalEndpoint:
+    Type: String
+    Default: https://bedrock-runtime.us-east-1.amazonaws.com
+    Description: The default Amazon Bedrock endpoint is in US-EAST-1. Review available Bedrock endpoints using AWS documentation- https://docs.aws.amazon.com/general/latest/gr/bedrock.html
+
+  BedrockRegion:
+    Type: String
+    Default: us-east-1
+    Description: The region for the Amazon Bedrock endpoint used above. Leave the us-east-1 if you have not changed the default endpoint.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: 'Which Bedrock regional endpoint you will use?'
+        Parameters:
+          - BedrockRegionalEndpoint
+          - BedrockRegion
+
+
+
+Resources:
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: 'PROVISIONED'
+      KeySchema:
+        - AttributeName: Case_ID
+          KeyType: HASH
+        - AttributeName: ARN
+          KeyType: RANGE
+      AttributeDefinitions:
+        - AttributeName: Case_ID
+          AttributeType: S
+        - AttributeName: ARN
+          AttributeType: S
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  AlarmSupportCasesNotifications:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: AlarmSupportCases-Notifications
+
+  CreateSupportCasesTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Alarm-Support-Cases-Trigger
+
+  YourLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/CW-Alarms-Support-Cases
+      RetentionInDays: 30
+
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CWAlarms-LambdaDynamoDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                  - dynamodb:UpdateTable
+                  - dynamodb:GetRecords
+                Resource: !GetAtt DynamoDBTable.Arn
+        - PolicyName: CWAlarms-LambdaSNSTopicPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlarmSupportCasesNotifications
+        - PolicyName: CWAlarms-CloudwatchLogging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:Describe*
+                  - cloudwatch:Get*
+                  - cloudwatch:List*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/CW-Alarms-Support-Cases:*'
+        - PolicyName: CWAlarms-Bedrock-InvokeModel-Claude-v2
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:${AWS::Partition}:bedrock:${BedrockRegion}::foundation-model/anthropic.claude-v2'
+        - PolicyName: CWAlarms-SupportCasesPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - support:DescribeCommunication
+                  - support:CreateCase
+                  - support:DescribeCases
+                  - support:DescribeServices
+                Resource: '*'
+
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - YourLogGroup
+    Properties:
+      FunctionName: CW-Alarms-Support-Cases
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import logging
+          from botocore.exceptions import ClientError
+          import datetime
+
+
+          # Initialize Environment Variables
+          sns_topic_arn = os.environ['SnsTopicArn']
+          dynamodb_table_name = os.environ['DynamoDBTableName']
+
+          # intialize Amazon Bedrock Client configuration
+          region_name= os.environ['BedrockRegion']
+          endpoint_url= os.environ['BedrockRegionalEndpoint']
+          bedrock = boto3.client(service_name='bedrock-runtime', region_name=region_name, endpoint_url=endpoint_url)
+          modelId = 'anthropic.claude-v2'
+          accept = 'application/json'
+          contentType = 'application/json'
+
+          # Initialize AWS DynamoDB, SNS, Support API and CloudWatch clients
+          dynamodb = boto3.client('dynamodb')
+          support_client = boto3.client('support')
+          sns_client = boto3.client('sns')
+          cloudwatch_client = boto3.client('cloudwatch')
+
+
+          # Defining Global variabvles
+          case_id_attribute_name = 'Case_ID'
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          class SupportWrapper:
+              '''Encapsulates Support actions.'''
+              def __init__(self, support_client):
+                  '''
+                  :param support_client: A Boto3 Support client.
+                  '''
+                  self.support_client = support_client
+
+              @classmethod
+              def from_client(cls):
+                  '''
+                  Instantiates this class from a Boto3 client.
+                  '''
+                  support_client = boto3.client('support')
+                  return cls(support_client)
+
+              def create_case(self, service, category, severity, details, subject, Emails):
+                  '''
+                  Create a new support case.
+
+                  :param service: The service to use for the new case.
+                  :param category: The category to use for the new case.
+                  :param severity: The severity to use for the new case.
+                  :return: The caseId of the new case.
+                  '''
+                  try:
+                      response = self.support_client.create_case(
+                          subject=f'{subject} Alarm is triggered - Please Investigate',
+                          serviceCode=service['code'],
+                          severityCode=severity['code'],
+                          categoryCode=category['code'],
+                          communicationBody=details,
+                          ccEmailAddresses=Emails,
+                          language='en',
+                          issueType='customer-service'
+                      )
+                      case_id = response['caseId']
+
+                  except ClientError as err:
+                      if err.response['Error']['Code'] == 'SubscriptionRequiredException':
+                          logger.info('You must have a Business, Enterprise On-Ramp, or Enterprise Support '
+                                      'plan to use the AWS Support API. \n\tPlease upgrade your subscription to run these '
+                                      'examples.')
+                      else:
+                          logger.error(
+                              'Could not create case. Here is why: %s: %s',
+                              err.response['Error']['Code'], err.response['Error']['Message'])
+                          raise
+                  else:
+                      return case_id
+
+
+
+          def case_status(support_client, case_id):
+              try:
+                  response = support_client.describe_cases(
+                      caseIdList=[case_id]
+                  )
+
+                  # Assuming the response contains case details in the 'cases' field
+                  cases = response.get('cases', [])
+                  if cases:
+                      case_status = cases[0].get('status')
+                      recent_correspondence = cases[0].get('recentCommunications', [])
+                      return case_status, recent_correspondence  # Return the case status and recent correspondence
+                  else:
+                      print('No matching case found for Case ID', case_id)
+                      return None, []  # No matching case found, return None for status and empty list for correspondence
+
+              except ClientError as err:
+                  print('Error:', err.response['Error']['Message'])
+                  return None, []  # Error occurred, return None for status and empty list for correspondence
+
+
+          def lambda_handler(event, context):
+              # Initialize variables to be used later in the lambda function
+              metric_math_values = []
+              metric_stat_values_text = []
+              metric_stat_values = []
+              Emails = []
+              service_json_blocks = []
+              category_json_blocks = []
+              service_valid = False
+
+              try:
+
+                  # Initialize the SupportWrapper
+                  support_wrapper = SupportWrapper.from_client()
+
+                  # List the available services
+                  response = support_client.describe_services()
+
+
+                  # Extract the 'services' key from the response
+                  services = response.get('services', [])
+
+              except ClientError as e:
+                  print(f'Error: {e.response["Error"]["Message"]}')
+              except Exception as e:
+                  print(f'Error: {e}')
+
+
+
+
+              # Create a block of ServiceCodes
+              for service in services:
+                  service_code = service.get('code', '')
+                  # Append the new JSON block to the list
+                  service_json_blocks.append(service_code)
+
+
+              try:
+                  # Extract Records from event JSON body
+                  if 'Records' in event:
+
+                      sns_message = event['Records'][0]['Sns']['Message']
+                      # Parse the JSON string into a dictionary
+                      data = json.loads(sns_message)
+                      # Extract common fields
+                      alarm_name = data.get('AlarmName')
+                      alarm_description = data.get('AlarmDescription')
+                      aws_account_id = data.get('AWSAccountId')
+                      alarm_arn = data.get('AlarmArn')
+                      new_state_reason = data.get('NewStateReason')
+                      metric_name = None
+                      namespace = None
+                      statistic = None
+                      dimensions = []
+
+
+                      # Check for the presence of 'Trigger' and which alarm type is source.
+                      #supported alarm types are Single Metric alarm and Metric Math alarm
+                      if 'Trigger' in data:
+
+                          trigger_data = data['Trigger']
+
+                          # Check for the presence of 'Metrics' in the trigger data
+                          if 'Metrics' in trigger_data:
+                              metrics_data = trigger_data['Metrics']
+
+                              for metric_data in metrics_data:
+
+                                  if 'Expression' in metric_data:
+                                      # Handle metrics with 'Expression'
+                                      metric_name = metric_data.get('Label')
+
+
+                                  elif 'MetricStat' in metric_data:
+
+                                      namespace = metric_data['MetricStat']['Metric'].get('Namespace')
+                                      dimensions = metric_data['MetricStat']['Metric'].get('Dimensions', [])
+
+
+                                      # Build the metric_math_alarm string directly
+                                      metric_math_alarm = (
+                                          f'Namespace: {namespace}\n'
+                                          f'Dimensions: {dimensions}\n'
+                                          f'{"=" * 30}\n'  # Separator
+                                      )
+
+                                      # Append the formatted string directly
+                                      metric_math_values.append(metric_math_alarm)
+                                      dimensions = []
+
+
+                          else:
+                              # Handle the first message structure or other cases
+                              trigger = data.get('Trigger', {})
+                              metric_name = trigger.get('MetricName')
+                              namespace = trigger.get('Namespace')
+                              statistic = trigger.get('Statistic')
+                              dimensions = trigger.get('Dimensions', [])
+
+                      print('Alarm Name:', alarm_name)
+                      print('Alarm Description:', alarm_description)
+                      print('AWS Account ID:', aws_account_id)
+                      print('Alarm ARN:', alarm_arn)
+                      print('Metric Name:', metric_name)
+                      print('Namespace:', namespace)
+                      print('Statistic:', statistic)
+                      print('Dimensions:', dimensions)
+                      print('Reason:', new_state_reason)
+
+
+                      # Combine the metric_stat_text
+                      metric_stat_text = (
+                          f'Alarm Name: {alarm_name}\n'
+                          f'Alarm Description: {alarm_description}\n'
+                          f'AWS Account ID: {aws_account_id}\n'
+                          f'Alarm ARN: {alarm_arn}\n'
+                          f'Metric Name: {metric_name}\n'
+                          f'Namespace: {namespace}\n'
+                          f'Statistic: {statistic}\n'
+                          f'Dimensions: {dimensions}\n'
+                          f'Reason: {new_state_reason}\n'
+                      )
+                      metric_stat_values_text.append(metric_stat_text)
+
+                      if metric_math_values:
+                          metric_stat_values_text.append('This alarm uses Metric Math. Here are the list of metrics in the expression:')
+                          for metric_math_value in metric_math_values:
+                              metric_stat_values_text.extend(metric_math_value.split('\n'))
+                      metric_stat_values_text.append('=' * 30)
+
+
+                  else:
+                      print('No Records or resources found in the event.')
+
+              except json.JSONDecodeError as e:
+                  print('JSON decoding error:', e)
+              except KeyError:
+                  print('Key not found in the JSON structure.')
+
+
+
+              # Search for items with matching ARN in DynamoDB
+              matching_case_ids = search_by_arn(dynamodb_table_name, alarm_arn)
+              open_ticket = '0'
+
+              #Return severity tag for the Case severity assignment
+              alarm_tags, severity, Emails= get_alarm_tags(alarm_arn)
+
+              #Appending the alarm tags and a seperator to a message block
+              formatted_output = '\n'.join([f'{item["Key"]}: {item["Value"]}' for item in alarm_tags])
+              formatted_output += f'\n======================================================='
+              #Appending metric event values to the message block
+              metric_stat_values_text = '\n'.join(metric_stat_values_text)
+              formatted_output += f'\nMetric Stat Values:\n{metric_stat_values_text}\n'
+
+
+              if matching_case_ids:
+
+
+                  for case_id in matching_case_ids:
+
+                      status, correspondence = case_status(support_wrapper.support_client, case_id)
+                      if status != 'resolved':
+                          open_ticket = '1' #A ticket that is yet unresolved is found
+                          communications = correspondence.get('communications', [])
+                          write_todynamodb(case_id, alarm_arn, new='0')  # Call to update the TriggerCount
+                          # Find the most recent correspondence
+                          latest_communication = max(communications, key=lambda comm: comm['timeCreated'], default=None)
+                          if latest_communication:
+                              timestamp = latest_communication.get('timeCreated', 'N/A')
+                              message = latest_communication.get('body', 'N/A')
+                              print(f'Latest Correspondence for Case ID {case_id}:\n')
+                              print(f'Timestamp: {timestamp}\nMessage: {message}\n')
+
+                              response = sns_client.publish(
+                                  TopicArn=sns_topic_arn,
+                                  Message=f'An Alarm with a Support Case action was triggered. The following Case ID {case_id} is still not resolved with status {status}. The latest correspondence in {timestamp}:\n{message}'
+                              )
+                              print('Message sent:', response['MessageId'])
+
+                              return {
+                                  'statusCode': 200,
+                                  'body': 'Case Update Notification sent successfully'
+                              }
+                          else:
+                              print(f'No correspondence found for Case ID {case_id}\n')
+                              response = sns_client.publish(
+                                  TopicArn=sns_topic_arn,
+                                  Message=f'An Alarm with a Support Case action was triggered. The following Case ID {case_id} is still open and not resolved. There is no correspondence in this ticket yet'
+                              )
+
+                      else:
+                          logger.info(f'The Case ID {case_id} is {status}')
+
+              if open_ticket == '0': #if unresolved ticket isn't in Dynamodb will proceed to Bedrock call
+
+                  # Call Bedrock to assign ServiceCode and CategoryCode
+                  # Create the JSON payload
+
+                  body = json.dumps({
+                      'prompt': (
+                          f'\n\nHuman: Please take your time, consider all the rules before answering <question1>.'
+                          f'Rule 1. Answer precisely must match a code value from ServiceCodes in the list <JSON block>{service_json_blocks}</JSON block>.'
+                          f'Rule 2. Breakdown CloudWatch metrics namespace:{namespace} and understand its techincal meaning. It relates to one AWS services in the cloud'
+                          f'Rule 3. Consider the condition in <Question1> carefully.'
+                          f'Rule 4. Answer <Question1> in a new line as per the output format showing below "without additional text or tags":'
+                          f'ServiceCode:<ServiceCode Value selected>'
+                          f'<Question1> Looking values from <JSON block>, if {namespace} is not AWS/Usage, which precise ServiceCode value from <JSON block> the namepsace:{namespace} best classify to?'
+                          f'Otherwise, Using strictly data in <JSON block>, select ServiceCode based on service information in {dimensions}.</Question1> \n\nAssistant:'
+
+                      ),
+                      'max_tokens_to_sample': 500,
+                      'temperature': 0,
+                      'top_p': 0.9
+                  })
+
+
+
+                  try:
+
+                      response = bedrock.invoke_model(body=body, modelId=modelId, accept=accept, contentType=contentType)
+                      response_body = json.loads(response.get('body').read())
+                      # text of the Bedrock API response
+                      text = response_body.get('completion')
+
+                  except Exception as e:
+                      print(f'Error invoking Amazon Bedrock: {e}')
+                      # Handle the error accordingly
+
+                  service_code = None
+                  print(text)
+                  for line in text.splitlines():
+                      line = line.replace(' ','')
+                      if line.startswith('ServiceCode:'):
+                          service_code = line.split(':')[1]
+
+                  # Extract CategoryCode values and create JSON block
+                  for service in services:
+
+                      if service.get('code', '') == service_code:
+                          categories = service.get('categories', [])
+                          for category in categories:
+                              category_json_blocks.append(category)
+
+                          # Create the JSON payload
+
+                          body = json.dumps({
+                              'prompt': (
+                                  f'\n\nHuman: Please take your time, consider all the rules before answering <question2>.'
+                                  f'Rule 1. Answer precisely must match a code from CategoryCodes in the list <JSON block>{category_json_blocks}</JSON block>.'
+                                  f'Rule 2. Breakdown CloudWatch metric_name:{metric_name} and understand its techincal meaning. '
+                                  f'Rule 3. Print nswer of <Question2> in new line and a key:value format "without additional text or tags":'
+                                  f'CategoryCode:<CategoryCode Value selected>'
+                                  f'<Question2> Using precise match from <JSON block>, which CategoryCode value in <JSON block> the metric_name:{namespace} issue best classify to?</Question2> \n\nAssistant:'
+
+                              ),
+                              'max_tokens_to_sample': 10000,
+                              'temperature': 0,
+                              'top_p': 0.9
+                          })
+
+                          # Send the API call to Bedrock
+                          response = bedrock.invoke_model(body=body, modelId=modelId, accept=accept, contentType=contentType)
+                          response_body = json.loads(response.get('body').read())
+                          text = response_body.get('completion')
+                          # ServiceCode recommended by Bedrock is valid, otherwise break
+                          service_valid = True
+                          category_code = None
+                  # if ServiceCode recommended by Bedrock is not valid, exit()
+                  if service_valid is not True:
+                      print('Bedrock provided invalid ServiceCode: ', service_code)
+                      return {'statusCode': 200, 'body': 'ServiceCode recommended by Bedrock is Invalid. Ensure the namespace used by metric is descriptive enough'}
+
+                  for line in text.splitlines():
+                      line = line.replace(' ','')
+                      if line.startswith('CategoryCode:'):
+                          category_code = line.split(':')[1]
+
+
+                  if service_code:
+                      service_code = service_code.replace(' ','')
+                      category_code = category_code.replace(' ','')
+
+                      print('Namespace: ', namespace)
+                      print('MetricName: ', metric_name)
+                      print('ServiceCode: ', service_code)
+                      print('CategoryCode: ', category_code)
+                      print('##########################################')
+
+                  # Create a case since no ticket for the same resource
+                  service_info = {'code': service_code}
+                  category_info = {'code': category_code}
+                  severity_info = {'code': severity}
+
+                  case_id = support_wrapper.create_case(service_info, category_info, severity_info, formatted_output, alarm_arn, Emails)
+                  logger.info('New case created with ID: %s', case_id)
+                  write_todynamodb(case_id, alarm_arn=alarm_arn, new='1')
+
+                  # Publish the message to the SNS topic
+                  response = sns_client.publish(
+                      TopicArn=sns_topic_arn,
+                      Message=f'A Ticket was created with Case ID {case_id} and included this body in the description:\n {formatted_output}'
+                  )
+                  print('Message sent:', response['MessageId'])
+
+                  return {
+                      'statusCode': 200,
+                      'body': 'Create Case Notification sent successfully'
+                  }
+
+              else:
+                  logger.info('No Action. Found matching items in DynamoDB: %s', matching_case_ids)
+
+
+
+              return {
+                  'statusCode': 200,
+                  'body': 'Search completed and a ticket from the same Alarm is open with Support'
+              }
+
+          def get_alarm_tags(alarm_arn):
+
+              try:
+                  response = cloudwatch_client.list_tags_for_resource(ResourceARN=alarm_arn)
+                  alarm_tags = response.get('Tags', [])
+
+                  # Severity default value is Low
+                  severity = 'low'
+                  Emails = []
+                  # Extract service, category, and severity from the tags
+                  for tag in alarm_tags:
+                      if tag['Key'] == 'SeverityCode':
+                          severity = tag['Value']
+                      elif tag['Key'] == 'OwnerEmail':
+                          Emails = [tag['Value']]
+
+                  # Replace spaces with commas
+                  Emails = [item.replace(' ', ',') for item in Emails]
+
+
+                  return alarm_tags, severity, Emails
+              except ClientError as err:
+                  print('Error:', err.response['Error']['Message'])
+                  return [], None, None, None
+
+          def search_by_arn(table_name, arn):
+              response = dynamodb.scan(
+                  TableName=table_name
+              )
+              items = response.get('Items', [])
+
+              matching_case_ids = []  # List to store matching case IDs
+
+              # Filter items with matching ARN
+              for item in items:
+                  if item.get('ARN', {}).get('S') == arn:
+                      matching_case_ids.append(item.get(case_id_attribute_name, {}).get('S'))
+
+              return matching_case_ids  # Return the list of matching case IDs
+
+
+          def write_todynamodb(case_id, alarm_arn, new):
+              if new == '1':
+                  # Case with matching ARN doesn't exist, create a new entry with count 1
+                  now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+                  dynamodb.put_item(
+                      TableName=dynamodb_table_name,
+                      Item={
+                          case_id_attribute_name: {'S': case_id},
+                          'ARN': {'S': alarm_arn},
+                          'TriggerCount': {'N': '1'},  # Initialize with 1
+                          'Timestamp': {'S': now}
+                      }
+                  )
+              elif new == '0':
+                  # Case with matching ARN already exists, update the count
+                  response = dynamodb.update_item(
+                      TableName=dynamodb_table_name,
+                      Key={
+                          case_id_attribute_name: {'S': case_id},
+                          'ARN': {'S': alarm_arn}  # Add the ARN as part of the key
+                      },
+                      UpdateExpression='SET TriggerCount = TriggerCount + :increment',
+                      ExpressionAttributeValues={
+                          ':increment': {'N': '1'}
+                      },
+                      ReturnValues='NONE'
+                  )
+
+
+      Runtime: python3.11
+      Timeout: 180
+      Environment:
+        Variables:
+          DynamoDBTableName: !Ref DynamoDBTable
+          SnsTopicArn: !Ref AlarmSupportCasesNotifications
+          BedrockRegionalEndpoint: !Ref BedrockRegionalEndpoint
+          BedrockRegion: !Ref BedrockRegion
+
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - Ref: AlarmSupportCasesNotifications
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sns:Publish
+            Resource: !GetAtt LambdaFunction.Arn
+
+  LambdaSNSTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref CreateSupportCasesTopic
+
+
+  SNSTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref CreateSupportCasesTopic
+      Endpoint: !GetAtt LambdaFunction.Arn

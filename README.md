@@ -1,4 +1,4 @@
-## My Project
+## Automate the creation of AWS support cases using Amazon CloudWatch Alarms
 
 TODO: Fill this README out!
 
