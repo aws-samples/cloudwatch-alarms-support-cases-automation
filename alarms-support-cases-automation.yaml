@@ -458,24 +458,27 @@ Resources:
 
                   # Call Bedrock to assign ServiceCode and CategoryCode
                   # Create the JSON payload
+                  # In case the AWS/TrustedAdvisor namespace is used, replace with dimensions
+                  if 'AWS/Usage' in namespace or 'AWS/TrustedAdvisor' in namespace:
+                      namespace_ai = dimensions
+                  else:
+                      namespace_ai = namespace
 
                   body = json.dumps({
                       'prompt': (
-                          f'\n\nHuman: Please take your time, consider all the rules before answering <question1>.'
-                          f'Rule 1. Answer precisely must match a code value from ServiceCodes in the list <JSON block>{service_json_blocks}</JSON block>.'
-                          f'Rule 2. Breakdown CloudWatch metrics namespace:{namespace} and understand its techincal meaning. It relates to one AWS services in the cloud'
-                          f'Rule 3. Consider the condition in <Question1> carefully.'
-                          f'Rule 4. Answer <Question1> in a new line as per the output format showing below "without additional text or tags":'
+                          f'\n\nHuman: Please take your time, consider all the rules before answering <Question1>.'
+                          f'Rule 1. Answer precisely must match a code valur from ServiceCodes in the list <JSON block>{service_json_blocks}</JSON block>.'
+                          f'Rule 2. Breakdown CloudWatch metrics namespace:{namespace_ai} and understand its technical meaning. It relates to one of AWS services in the cloud'
+                          f'Rule 3. Answer <Question1> in a new line as per the output format showing below "without additional text or tags":'
                           f'ServiceCode:<ServiceCode Value selected>'
-                          f'<Question1> Looking values from <JSON block>, if {namespace} is not AWS/Usage, which precise ServiceCode value from <JSON block> the namepsace:{namespace} best classify to?'
-                          f'Otherwise, Using strictly data in <JSON block>, select ServiceCode based on service information in {dimensions}.</Question1> \n\nAssistant:'
+                          f'<Question1> Looking up values from <JSON block>, select ServiceCode value from <JSON block> which the namepsace:{namespace_ai} best classifies to?</Question1>'
+                          f' \n\nAssistant:'
 
                       ),
                       'max_tokens_to_sample': 500,
                       'temperature': 0,
                       'top_p': 0.9
                   })
-
 
 
                   try:
@@ -508,12 +511,12 @@ Resources:
 
                           body = json.dumps({
                               'prompt': (
-                                  f'\n\nHuman: Please take your time, consider all the rules before answering <question2>.'
+                                  f'\n\nHuman: Please take your time, consider all the rules before answering <Question2>.'
                                   f'Rule 1. Answer precisely must match a code from CategoryCodes in the list <JSON block>{category_json_blocks}</JSON block>.'
-                                  f'Rule 2. Breakdown CloudWatch metric_name:{metric_name} and understand its techincal meaning. '
-                                  f'Rule 3. Print nswer of <Question2> in new line and a key:value format "without additional text or tags":'
+                                  f'Rule 2. Breakdown CloudWatch metric_name:{metric_name} and understand its technical meaning. '
+                                  f'Rule 3. Answer <Question2> in a new line as per the output format showing below "without additional text or tags":'
                                   f'CategoryCode:<CategoryCode Value selected>'
-                                  f'<Question2> Using precise match from <JSON block>, which CategoryCode value in <JSON block> the metric_name:{namespace} issue best classify to?</Question2> \n\nAssistant:'
+                                  f'<Question2> Using precise match from <JSON block>, which CategoryCode value in <JSON block> the metric_name:{metric_name} issue best classify to?</Question2> \n\nAssistant:'
 
                               ),
                               'max_tokens_to_sample': 10000,
