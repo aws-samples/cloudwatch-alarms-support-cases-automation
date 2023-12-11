@@ -3,12 +3,7 @@
 [![License](https://img.shields.io/badge/license-MIT--0-green)](LICENSE)
 [![AWS Provider](https://img.shields.io/badge/provider-AWS-orange?logo=amazon-aws&color=ff9900)](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/WhatIsCloudWatch.html)
 
-TODO: Fill this README out!
-
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
+This code is delivered part of AWS blog post. For the full walkthrough and instructions to deploy, [visit this blog.](https://aws.amazon.com/blogs/mt/automate-the-creation-of-aws-support-cases-using-amazon-cloudwatch-alarms-and-amazon-bedrock)
 
 ## Security
 
