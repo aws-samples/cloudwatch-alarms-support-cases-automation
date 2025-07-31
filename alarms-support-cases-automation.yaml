@@ -123,14 +123,16 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/CW-Alarms-Support-Cases:*'
-        - PolicyName: CWAlarms-Bedrock-InvokeModel-Claude-v2
+        - PolicyName: CWAlarms-Bedrock-InvokeModel-Claude-sonnet-3-7
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
                   - bedrock:InvokeModel
-                Resource: !Sub 'arn:${AWS::Partition}:bedrock:${BedrockRegion}::foundation-model/anthropic.claude-v2'
+                Resource: 
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.claude-3-7-sonnet-20250219-v1:0'
+                  - !Sub 'arn:aws:bedrock:us-east-1:${AWS::AccountId}:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0'
         - PolicyName: CWAlarms-SupportCasesPolicy
           PolicyDocument:
             Version: '2012-10-17'
@@ -170,7 +172,7 @@ Resources:
           region_name= os.environ['BedrockRegion']
           endpoint_url= os.environ['BedrockRegionalEndpoint']
           bedrock = boto3.client(service_name='bedrock-runtime', region_name=region_name, endpoint_url=endpoint_url)
-          modelId = 'anthropic.claude-v2'
+          modelId = 'us.anthropic.claude-3-7-sonnet-20250219-v1:0' 
           accept = 'application/json'
           contentType = 'application/json'
 
@@ -465,20 +467,29 @@ Resources:
                       namespace_ai = namespace
 
                   body = json.dumps({
-                      'prompt': (
-                          f'\n\nHuman: Please take your time, consider all the rules before answering <Question1>.'
-                          f'Rule 1. Answer precisely must match a code valur from ServiceCodes in the list <JSON block>{service_json_blocks}</JSON block>.'
-                          f'Rule 2. Breakdown CloudWatch metrics namespace:{namespace_ai} and understand its technical meaning. It relates to one of AWS services in the cloud'
-                          f'Rule 3. Answer <Question1> in a new line as per the output format showing below "without additional text or tags":'
-                          f'ServiceCode:<ServiceCode Value selected>'
-                          f'<Question1> Looking up values from <JSON block>, select ServiceCode value from <JSON block> which the namepsace:{namespace_ai} best classifies to?</Question1>'
-                          f' \n\nAssistant:'
-
-                      ),
-                      'max_tokens_to_sample': 500,
-                      'temperature': 0,
-                      'top_p': 0.9
+                      "anthropic_version": "bedrock-2023-05-31",
+                      "max_tokens": 500,
+                      "temperature": 0.0,
+                      "top_p": 0.9,
+                      "messages": [
+                          {
+                              "role": "user",
+                              "content": [
+                                  {
+                                      "type": "text",
+                                      "text": (
+                                          f"Please take your time, consider all the rules before answering <Question1>.\n"
+                                          f"Rule 1. Answer precisely using one value from this JSON list of ServiceCodes: {service_json_blocks}.\n"
+                                          f"Rule 2. The CloudWatch namespace is: {namespace_ai} — interpret its technical meaning.\n"
+                                          f"Rule 3. Reply in the format:\nServiceCode:<ServiceCode Value selected>\n"
+                                          f"<Question1> Which ServiceCode best matches namespace {namespace_ai}?</Question1>"
+                                      )
+                                  }
+                              ]
+                          }
+                      ]
                   })
+
 
 
                   try:
@@ -486,14 +497,14 @@ Resources:
                       response = bedrock.invoke_model(body=body, modelId=modelId, accept=accept, contentType=contentType)
                       response_body = json.loads(response.get('body').read())
                       # text of the Bedrock API response
-                      text = response_body.get('completion')
+                      text = response_body.get("content", [{}])[0].get("text")  # ✅ correct for Claude 3
+                      print(response)
 
                   except Exception as e:
                       print(f'Error invoking Amazon Bedrock: {e}')
                       # Handle the error accordingly
 
                   service_code = None
-                  print(text)
                   for line in text.splitlines():
                       line = line.replace(' ','')
                       if line.startswith('ServiceCode:'):
@@ -510,24 +521,34 @@ Resources:
                           # Create the JSON payload
 
                           body = json.dumps({
-                              'prompt': (
-                                  f'\n\nHuman: Please take your time, consider all the rules before answering <Question2>.'
-                                  f'Rule 1. Answer precisely must match a code from CategoryCodes in the list <JSON block>{category_json_blocks}</JSON block>.'
-                                  f'Rule 2. Breakdown CloudWatch metric_name:{metric_name} and understand its technical meaning. '
-                                  f'Rule 3. Answer <Question2> in a new line as per the output format showing below "without additional text or tags":'
-                                  f'CategoryCode:<CategoryCode Value selected>'
-                                  f'<Question2> Using precise match from <JSON block>, which CategoryCode value in <JSON block> the metric_name:{metric_name} issue best classify to?</Question2> \n\nAssistant:'
-
-                              ),
-                              'max_tokens_to_sample': 10000,
-                              'temperature': 0,
-                              'top_p': 0.9
+                              "anthropic_version": "bedrock-2023-05-31",
+                              "max_tokens": 1000,
+                              "temperature": 0.0,
+                              "top_p": 0.9,
+                              "messages": [
+                                  {
+                                      "role": "user",
+                                      "content": [
+                                          {
+                                              "type": "text",
+                                              "text": (
+                                                  f"Please take your time, consider all the rules before answering <Question2>.\n"
+                                                  f"Rule 1. Answer precisely using one value from this list of CategoryCodes: {category_json_blocks}.\n"
+                                                  f"Rule 2. The CloudWatch metric is: {metric_name}. Understand its meaning.\n"
+                                                  f"Rule 3. Reply in the format:\nCategoryCode:<CategoryCode Value selected>\n"
+                                                  f"<Question2> Which CategoryCode best matches metric {metric_name}?</Question2>"
+                                              )
+                                          }
+                                      ]
+                                  }
+                              ]
                           })
+
 
                           # Send the API call to Bedrock
                           response = bedrock.invoke_model(body=body, modelId=modelId, accept=accept, contentType=contentType)
                           response_body = json.loads(response.get('body').read())
-                          text = response_body.get('completion')
+                          text = response_body.get("content", [{}])[0].get("text")  # ✅ correct for Claude 3
                           # ServiceCode recommended by Bedrock is valid, otherwise break
                           service_valid = True
                           category_code = None
@@ -652,6 +673,7 @@ Resources:
                       },
                       ReturnValues='NONE'
                   )
+
 
 
       Runtime: python3.11
